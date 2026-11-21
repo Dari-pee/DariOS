@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 #include "pci.h"
 #include "timer.h"
 #include "usb_msc.h"
@@ -216,6 +217,9 @@ static int controller_start(void)
     async_qh.next = QTD_TERMINATE;
     async_qh.alternate = QTD_TERMINATE;
     async_qh.token = 0;
+    transfer_qh.next = QTD_TERMINATE;
+    transfer_qh.alternate = QTD_TERMINATE;
+    transfer_qh.token = 0;
     mmio_write32(EHCI_ASYNCLIST, (uint32_t)(uintptr_t)&async_qh);
     mmio_write32(EHCI_CONFIGFLAG, 1);
     mmio_write32(EHCI_USBCMD, CMD_RUN | CMD_ASYNC);
@@ -249,24 +253,38 @@ static void qtd_prepare(ehci_qtd_t *td, uint32_t next, uint32_t pid,
     qtd_set_buffer(td, data, len);
 }
 
-static int wait_transfer(ehci_qh_t *qh)
+static int wait_transfer(ehci_qtd_t *tds, int td_count)
 {
     for (uint32_t i = 0; i < EHCI_TIMEOUT_MS; i++) {
-        uint32_t token = qh->token;
-        if (!(token & QTD_ACTIVE))
-            return (token & (QTD_HALTED | QTD_DATABUFERR | QTD_BABBLE | QTD_XACTERR)) ? -1 : 0;
+        int all_done = 1;
+        for (int td = 0; td < td_count; td++) {
+            uint32_t token = tds[td].token;
+            if (token & (QTD_HALTED | QTD_DATABUFERR | QTD_BABBLE | QTD_XACTERR)) {
+                printf("EHCI transfer error td=%d token=%x qh=%x\n", td, token,
+                       transfer_qh.token);
+                return -1;
+            }
+            if (token & QTD_ACTIVE)
+                all_done = 0;
+        }
+        if (all_done)
+            return 0;
         delay_tick();
     }
+    printf("EHCI transfer timeout qh=%x", transfer_qh.token);
+    for (int td = 0; td < td_count; td++)
+        printf(" td%d=%x", td, tds[td].token);
+    printf("\n");
     return -1;
 }
 
-static int run_transfer(ehci_qh_t *qh, ehci_qtd_t *first)
+static int run_transfer(ehci_qh_t *qh, ehci_qtd_t *first, int td_count)
 {
     qh->current = 0;
     qh->next = (uint32_t)(uintptr_t)first;
     qh->alternate = QTD_TERMINATE;
     qh->token = 0;
-    return wait_transfer(qh);
+    return wait_transfer(first, td_count);
 }
 
 static int control_transfer(uint8_t addr, uint8_t max_packet, usb_setup_t *setup,
@@ -289,7 +307,7 @@ static int control_transfer(uint8_t addr, uint8_t max_packet, usb_setup_t *setup
     } else {
         qtd_prepare(&transfer_tds[1], QTD_TERMINATE, QTD_PID_IN, 1, 0, 0, 1);
     }
-    if (run_transfer(&transfer_qh, &transfer_tds[0]) < 0)
+    if (run_transfer(&transfer_qh, &transfer_tds[0], length ? 3 : 2) < 0)
         return -1;
     return length;
 }
@@ -303,7 +321,7 @@ static int bulk_transfer(uint8_t endpoint, uint16_t mps, int in,
     transfer_qh.endpoint_caps = 0;
     qtd_prepare(&transfer_tds[0], QTD_TERMINATE, in ? QTD_PID_IN : QTD_PID_OUT,
                 *toggle, data, length, 1);
-    if (run_transfer(&transfer_qh, &transfer_tds[0]) < 0)
+    if (run_transfer(&transfer_qh, &transfer_tds[0], 1) < 0)
         return -1;
     *toggle ^= (uint8_t)((length + mps - 1u) / mps);
     return length;
@@ -333,10 +351,8 @@ static int enumerate_storage(void)
     timer_sleep_ms(10);
     device_address = 1;
 
-    usb_setup_t getdev = {0x80, 6, 0x0100, 0, 18};
     if (ctrl(0x80, 6, 0x0100, 0, device_desc, 18) < 0)
         return -4;
-    usb_setup_t getcfg = {0x80, 6, 0x0200, 0, 9};
     if (ctrl(0x80, 6, 0x0200, 0, config, 9) < 0)
         return -5;
     uint16_t total = (uint16_t)(config[2] | (config[3] << 8));
@@ -393,6 +409,7 @@ static uint32_t be32_load(const uint8_t *p)
 
 static int bot_cmd(uint8_t *cdb, uint8_t cdb_len, void *data, uint32_t len, int in)
 {
+    uint8_t opcode = cdb[0];
     cbw.signature = 0x43425355u;
     cbw.tag = ++bot_tag;
     cbw.data_length = len;
@@ -400,16 +417,26 @@ static int bot_cmd(uint8_t *cdb, uint8_t cdb_len, void *data, uint32_t len, int 
     cbw.lun = 0;
     cbw.command_length = cdb_len;
     for (int i = 0; i < 16; i++) cbw.command[i] = i < cdb_len ? cdb[i] : 0;
-    if (bulk_transfer(ep_out, bulk_mps, 0, &cbw, sizeof(cbw), &out_toggle) != sizeof(cbw))
+    if (bulk_transfer(ep_out, bulk_mps, 0, &cbw, sizeof(cbw), &out_toggle) != sizeof(cbw)) {
+        printf("USB BOT %x: CBW failed\n", opcode);
         return -1;
+    }
     if (len && bulk_transfer(in ? ep_in : ep_out, bulk_mps, in, data,
-                             (uint16_t)len, in ? &in_toggle : &out_toggle) != (int)len)
+                             (uint16_t)len, in ? &in_toggle : &out_toggle) != (int)len) {
+        printf("USB BOT %x: data failed\n", opcode);
         return -2;
+    }
     for (int i = 0; i < sizeof(csw); i++) ((uint8_t *)&csw)[i] = 0;
-    if (bulk_transfer(ep_in, bulk_mps, 1, &csw, sizeof(csw), &in_toggle) != sizeof(csw))
+    if (bulk_transfer(ep_in, bulk_mps, 1, &csw, sizeof(csw), &in_toggle) != sizeof(csw)) {
+        printf("USB BOT %x: CSW failed\n", opcode);
         return -3;
+    }
     if (csw.signature != 0x53425355u || csw.tag != cbw.tag || csw.status != 0)
+    {
+        printf("USB BOT %x: bad CSW sig=%x tag=%x/%x status=%u\n", opcode,
+               csw.signature, csw.tag, cbw.tag, csw.status);
         return -4;
+    }
     return 0;
 }
 
@@ -420,6 +447,7 @@ static int storage_initialize(void)
     cdb[0] = 0x12; cdb[4] = sizeof(inquiry);
     if (bot_cmd(cdb, 6, inquiry, sizeof(inquiry), 1) < 0)
         return -1;
+    for (int i = 0; i < sizeof(cdb); i++) cdb[i] = 0;
     cdb[0] = 0; /* TEST UNIT READY */
     for (int tries = 0; tries < 10; tries++) {
         if (bot_cmd(cdb, 6, 0, 0, 0) == 0)
@@ -428,9 +456,17 @@ static int storage_initialize(void)
         if (tries == 9)
             return -2;
     }
+    for (int i = 0; i < sizeof(cdb); i++) cdb[i] = 0;
     cdb[0] = 0x25; /* READ CAPACITY(10) */
-    if (bot_cmd(cdb, 10, io_buffer, 8, 1) < 0)
+    if (bot_cmd(cdb, 10, io_buffer, 8, 1) < 0) {
+        uint8_t sense_cdb[16] = {0};
+        uint8_t sense[18] = {0};
+        sense_cdb[0] = 0x03; sense_cdb[4] = sizeof(sense);
+        if (bot_cmd(sense_cdb, 6, sense, sizeof(sense), 1) == 0)
+            printf("USB SENSE key=%x asc=%x ascq=%x\n", sense[2] & 0x0Fu,
+                   sense[12], sense[13]);
         return -3;
+    }
     uint32_t last_lba = be32_load(io_buffer);
     sector_size = be32_load(io_buffer + 4);
     if (last_lba == 0xFFFFFFFFu || sector_size != 512)
@@ -444,6 +480,7 @@ int usb_msc_init(void)
     active = 0;
     if (controller_start() < 0)
         return -1;
+    printf("EHCI: %u root port(s)\n", port_count);
     for (uint8_t p = 0; p < port_count; p++) {
         uint32_t off = EHCI_PORTSC + 4u * p;
         uint32_t v = mmio_read32(off);
@@ -463,10 +500,15 @@ int usb_msc_init(void)
         v = mmio_read32(off);
         if (!(v & PORT_ENABLE))
             continue; /* Full/low-speed devices belong to EHCI companion controllers. */
-        if (enumerate_storage() == 0 && storage_initialize() == 0) {
+        int er = enumerate_storage();
+        if (er == 0) er = storage_initialize();
+        if (er == 0) {
             active = 1;
+            printf("EHCI: USB mass-storage device ready (%u sectors)\n", sector_count);
             return 0;
         }
+        printf("EHCI port %u device setup failed (%d)\n", p + 1, er);
+        return -20 + er;
     }
     return -2;
 }

@@ -49,6 +49,42 @@ struct elf32_program_header {
 
 static struct proapi api;
 
+static int resolve_mount_path(const char *input, char *output, size_t output_size)
+{
+    size_t prefix = 0;
+    if (!input || !output || output_size == 0)
+        return 0;
+
+    size_t input_len = strlen(input);
+    if (input_len >= 3 && toupper((unsigned char)input[0]) == 'M' &&
+        toupper((unsigned char)input[1]) == 'N' &&
+        toupper((unsigned char)input[2]) == 'T' &&
+        (input[3] == '\0' || input[3] == '/' || input[3] == '\\')) {
+        output[prefix++] = '2';
+        output[prefix++] = ':';
+        output[prefix++] = '/';
+        size_t i = 3;
+        while (input[i] == '/' || input[i] == '\\')
+            i++;
+        while (input[i]) {
+            if (prefix + 1 >= output_size)
+                return 0;
+            output[prefix++] = input[i++];
+        }
+        output[prefix] = '\0';
+        return 1;
+    }
+
+    while (input[prefix]) {
+        if (prefix + 1 >= output_size)
+            return 0;
+        output[prefix] = input[prefix];
+        prefix++;
+    }
+    output[prefix] = '\0';
+    return 1;
+}
+
 static int program_write(int fd, const void *buffer, uint32_t count)
 {
     if ((fd != 1 && fd != 2) || (!buffer && count))
@@ -146,8 +182,13 @@ static void cmd_write(char *args) {
         return;
     }
 
+    char path[128];
+    if (!resolve_mount_path(args, path, sizeof(path))) {
+        printf("write: path is too long\n");
+        return;
+    }
     FIL file;
-    FRESULT res = f_open(&file, args, FA_WRITE | FA_CREATE_ALWAYS);
+    FRESULT res = f_open(&file, path, FA_WRITE | FA_CREATE_ALWAYS);
     if (res != FR_OK) {
         printf("write: cannot open %s (error %d)\n", args, res);
         return;
@@ -175,12 +216,65 @@ static void cmd_rm(char *args) {
         return;
     }
 
-    FRESULT res = f_unlink(args);
+    char path[128];
+    if (!resolve_mount_path(args, path, sizeof(path))) {
+        printf("rm: path is too long\n");
+        return;
+    }
+    FRESULT res = f_unlink(path);
     if (res == FR_OK) {
         printf("Removed %s\n", args);
     } else {
         printf("rm: cannot remove %s (error %d)\n", args, res);
     }
+}
+
+static const char *fr_text(FRESULT r)
+{
+    static const char *names[] = {
+        "ok", "disk error", "internal error", "drive not ready", "no such file",
+        "no such path", "invalid name", "access denied", "already exists",
+        "invalid object", "write protected", "invalid drive", "not enabled",
+        "no filesystem"
+    };
+    return (unsigned)r < sizeof(names) / sizeof(names[0]) ? names[r] : "error";
+}
+
+/* Builds the full new name for a move. If 'dst' is a folder the file keeps its
+   own name inside it (dst + "/" + name), because f_rename wants the complete new
+   path, not just the folder. Returns 1 on success, 0 if it doesn't fit. */
+static int build_move_target(const char *src, const char *dst, int dst_is_dir,
+                             char *out, size_t out_size)
+{
+    size_t pos = 0;
+    size_t dlen = strlen(dst);
+
+    if (dlen + 1 >= out_size)
+        return 0;
+    for (size_t i = 0; i < dlen; i++)
+        out[pos++] = dst[i];
+
+    if (dst_is_dir) {
+        const char *name = src;
+        for (const char *p = src; *p; p++)
+            if (*p == '/' || *p == '\\' || *p == ':')
+                name = p + 1;
+
+        size_t nlen = strlen(name);
+        if (nlen == 0)
+            return 0;
+
+        int has_sep = dlen > 0 && (dst[dlen - 1] == '/' || dst[dlen - 1] == '\\');
+        if (pos + (has_sep ? 0 : 1) + nlen + 1 > out_size)
+            return 0;
+        if (!has_sep)
+            out[pos++] = '/';
+        for (size_t i = 0; i < nlen; i++)
+            out[pos++] = name[i];
+    }
+
+    out[pos] = '\0';
+    return 1;
 }
 
 static void cmd_mv(char *args)
@@ -190,27 +284,38 @@ static void cmd_mv(char *args)
         return;
     }
 
-    char *destination = args;
-    while (*destination && *destination != ' ' && *destination != '\t')
-        destination++;
-    if (*destination == '\0') {
+    char *dst = strchr(args, ' ');
+    if (dst == NULL) {
+        printf("Usage: mv <source> <destination>\n");
+        return;
+    }
+    *dst++ = '\0';
+    while (*dst == ' ')
+        dst++;
+    if (*dst == '\0') {
         printf("Usage: mv <source> <destination>\n");
         return;
     }
 
-    *destination++ = '\0';
-    while (*destination == ' ' || *destination == '\t')
-        destination++;
-    if (*args == '\0' || *destination == '\0') {
-        printf("Usage: mv <source> <destination>\n");
+    size_t dlen = strlen(dst);
+    int dst_is_dir = dst[dlen - 1] == '/' || dst[dlen - 1] == '\\' || dst[dlen - 1] == ':';
+    if (!dst_is_dir) {
+        FILINFO info;
+        if (f_stat(dst, &info) == FR_OK && (info.fattrib & AM_DIR))
+            dst_is_dir = 1;
+    }
+
+    char target[128];
+    if (!build_move_target(args, dst, dst_is_dir, target, sizeof(target))) {
+        printf("mv: path too long\n");
         return;
     }
 
-    FRESULT res = f_rename(args, destination);
+    FRESULT res = f_rename(args, target);
     if (res == FR_OK)
-        printf("Moved %s to %s\n", args, destination);
+        printf("Moved %s to %s\n", args, target);
     else
-        printf("mv: cannot move %s to %s (error %d)\n", args, destination, res);
+        printf("mv: cannot move %s to %s (%s, error %d)\n", args, target, fr_text(res), res);
 }
 
 static void cmd_mkdir(char *args) {
@@ -219,7 +324,12 @@ static void cmd_mkdir(char *args) {
         return;
     }
 
-    FRESULT res = f_mkdir(args);
+    char path[128];
+    if (!resolve_mount_path(args, path, sizeof(path))) {
+        printf("mkdir: path is too long\n");
+        return;
+    }
+    FRESULT res = f_mkdir(path);
     if (res == FR_OK) {
         printf("Created %s\n", args);
     } else {
@@ -229,7 +339,26 @@ static void cmd_mkdir(char *args) {
 
 static void cmd_cd(char *args) {
     if (args != NULL && *args != '\0') {
-        FRESULT res = f_chdir(args);
+        char path[128];
+        FRESULT res;
+        if (strcmp(args, "..") == 0) {
+            char cwd[128];
+            if (f_getcwd(cwd, sizeof(cwd)) == FR_OK && strcmp(cwd, "2:/") == 0) {
+                res = f_chdir("0:/");
+                if (res == FR_OK)
+                    res = f_chdrive("0:");
+            } else {
+                res = f_chdir("..");
+            }
+        } else if (resolve_mount_path(args, path, sizeof(path))) {
+            res = f_chdir(path);
+            if (res == FR_OK && path[1] == ':' && path[0] >= '0' && path[0] <= '9') {
+                char drive[3] = { path[0], ':', '\0' };
+                res = f_chdrive(drive);
+            }
+        } else {
+            res = FR_INVALID_NAME;
+        }
         if (res != FR_OK) {
             printf("cd: cannot change to %s (error %d)\n", args, res);
         }
@@ -238,7 +367,9 @@ static void cmd_cd(char *args) {
 
     char path[128];
     FRESULT res = f_getcwd(path, sizeof(path));
-    if (res == FR_OK)
+    if (res == FR_OK && path[0] == '2' && path[1] == ':' && path[2] == '/')
+        printf("MNT/%s\n", path[3] ? path + 3 : "");
+    else if (res == FR_OK)
         printf("%s\n", path);
     else
         printf("cd: cannot read current directory (error %d)\n", res);
@@ -248,7 +379,9 @@ static void cmd_pwd(char *args) {
     (void)args;
     char path[128];
     FRESULT res = f_getcwd(path, sizeof(path));
-    if (res == FR_OK)
+    if (res == FR_OK && path[0] == '2' && path[1] == ':' && path[2] == '/')
+        printf("MNT/%s\n", path[3] ? path + 3 : "");
+    else if (res == FR_OK)
         printf("%s\n", path);
     else
         printf("pwd: cannot read current directory (error %d)\n", res);
@@ -391,7 +524,12 @@ static void cmd_exec(char *args)
     }
 
     uint32_t entry;
-    FRESULT res = load_program(args, &entry);
+    char path[128];
+    if (!resolve_mount_path(args, path, sizeof(path))) {
+        printf("exec: path is too long\n");
+        return;
+    }
+    FRESULT res = load_program(path, &entry);
     if (res != FR_OK) {
         printf("exec: cannot load %s (error %d)\n", args, res);
         return;
@@ -412,7 +550,12 @@ static void cmd_cat(char *args) {
         return;
     }
 
-    res = f_open(&file, args, FA_READ);
+    char path[128];
+    if (!resolve_mount_path(args, path, sizeof(path))) {
+        printf("cat: path is too long\n");
+        return;
+    }
+    res = f_open(&file, path, FA_READ);
     if (res != FR_OK) {
         printf("cat: cannot open %s (error %d)\n", args, res);
         return;
@@ -440,7 +583,13 @@ static void cmd_ls(char *args) {
     FILINFO info;
     FRESULT res;
 
+    char resolved_path[128];
     const char *path = (args && *args) ? args : ".";
+    if (!resolve_mount_path(path, resolved_path, sizeof(resolved_path))) {
+        printf("ls: path is too long\n");
+        return;
+    }
+    path = resolved_path;
 
     res = f_opendir(&dir, path);
     if (res != FR_OK) {
@@ -515,3 +664,4 @@ void shell_run(void) {
             printf("Unknown command: %s\n", input);
     }
 }
+// 677777
