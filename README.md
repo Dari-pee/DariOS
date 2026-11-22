@@ -8,7 +8,7 @@ some thanks to nanobyte aswell
 DOS uses the FAT32 Filesystem  
 i changed from FAT12 to FAT32 since FAT12 sucked  
 love you fatfs ❤️❤️  
-i also added a MV command to move shit
+Pls make this Linux 2.0
 
 
 " no matter how ridiculous the odds may seem,  
