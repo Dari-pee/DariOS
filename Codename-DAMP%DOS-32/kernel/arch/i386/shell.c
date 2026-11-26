@@ -15,6 +15,7 @@
 #define ELF_LOAD_MAX 0x01000000u
 #define USER_DIR     "0:/USER/"
 #define USER_EXT     ".BIN"
+#define EDITOR_CAPACITY 4096u
 
 #define ELF_PT_LOAD 1
 #define ELF_PF_X    1
@@ -157,7 +158,7 @@ static FRESULT load_elf(FIL *file, uint32_t file_size, uint32_t *entry_out)
 
 static void cmd_help(char *args) {
     (void)args;
-    printf("Commands: about, cd [directory], clear, echo <text>, help, ls [directory], pwd, cat <file>, write <file> <text>, exec <file.bin|file.elf>, mkdir <directory>, rm <path>, mv <source> <destination>\n");
+    printf("Commands: about, cd [directory], clear, echo <text>, help, ls [directory], pwd, cat <file>, write <file> <text>, edit <file>, exec <file.bin|file.elf>, mkdir <directory>, rm <path>, mv <source> <destination>\n");
     printf("If you are Running a Program, Make sure to change your Directory to User, Using cd user. Then run exec <filename> to run the file.\n");
 }
 
@@ -210,6 +211,108 @@ static void cmd_write(char *args) {
     }
 }
 
+static int editor_save(const char *path, const char *text, UINT length)
+{
+    FIL file;
+    UINT written = 0;
+    FRESULT res = f_open(&file, path, FA_WRITE | FA_CREATE_ALWAYS);
+    if (res != FR_OK) {
+        printf("edit: cannot save (error %d)\n", res);
+        return 0;
+    }
+    res = f_write(&file, text, length, &written);
+    FRESULT close_res = f_close(&file);
+    if (res != FR_OK || written != length || close_res != FR_OK) {
+        printf("edit: save failed (error %d)\n", res != FR_OK ? res : close_res);
+        return 0;
+    }
+    printf("Saved %u bytes\n", written);
+    return 1;
+}
+
+/* A small line editor. Commands are entered on their own line. */
+static void cmd_edit(char *args)
+{
+    char path[128], text[EDITOR_CAPACITY], line[128];
+    UINT length = 0;
+    FIL file;
+    FRESULT res;
+    if (!args || !*args) {
+        printf("Usage: edit <file>\n");
+        return;
+    }
+    if (!resolve_mount_path(args, path, sizeof(path))) {
+        printf("edit: path is too long\n");
+        return;
+    }
+
+    res = f_open(&file, path, FA_READ);
+    if (res == FR_OK) {
+        UINT got = 0;
+        FSIZE_t size = f_size(&file);
+        if (size >= EDITOR_CAPACITY) {
+            f_close(&file);
+            printf("edit: file is too large (maximum %u bytes)\n", EDITOR_CAPACITY - 1);
+            return;
+        }
+        res = f_read(&file, text, (UINT)size, &got);
+        f_close(&file);
+        if (res != FR_OK || got != size) {
+            printf("edit: could not read file (error %d)\n", res);
+            return;
+        }
+        length = got;
+        text[length] = '\0';
+    } else if (res == FR_NO_FILE || res == FR_NO_PATH) {
+        text[0] = '\0';
+    } else {
+        printf("edit: cannot open %s (error %d)\n", args, res);
+        return;
+    }
+
+    printf("Editing %s (new lines append). :w save, :q quit, :wq save and quit, :q! discard, :clear erase buffer.\n", args);
+    if (length) {
+        printf("%s", text);
+        if (text[length - 1] != '\n') putchar('\n');
+    }
+    while (1) {
+        size_t line_len = 0;
+        printf("| ");
+        while (1) {
+            char c = keyboard_getchar();
+            if (!c) { __asm__ volatile ("hlt"); continue; }
+            if (c == '\n' || c == '\r') {
+                putchar('\n'); line[line_len] = '\0'; break;
+            }
+            if (c == '\b' || c == 127) {
+                if (line_len) { line_len--; putchar('\b'); putchar(' '); putchar('\b'); }
+                continue;
+            }
+            if (c >= ' ' && c <= '~' && line_len < sizeof(line) - 1) {
+                line[line_len++] = c; putchar(c);
+            }
+        }
+        if (line_len && line[0] == ':') {
+            if (strcmp(line, ":w") == 0) { editor_save(path, text, length); continue; }
+            if (strcmp(line, ":wq") == 0) { if (editor_save(path, text, length)) return; continue; }
+            if (strcmp(line, ":q") == 0) return;
+            if (strcmp(line, ":q!") == 0) { printf("Changes discarded\n"); return; }
+            if (strcmp(line, ":clear") == 0) { length = 0; text[0] = '\0'; printf("Buffer cleared\n"); continue; }
+            printf("Unknown editor command\n");
+            continue;
+        }
+        UINT separator = length && text[length - 1] != '\n' ? 1u : 0u;
+        if (length + separator + line_len + 1 >= EDITOR_CAPACITY) {
+            printf("edit: buffer full; save with :w or quit with :q\n");
+            continue;
+        }
+        if (separator) text[length++] = '\n';
+        for (size_t i = 0; i < line_len; i++) text[length++] = line[i];
+        text[length++] = '\n';
+        text[length] = '\0';
+    }
+}
+
 static void cmd_rm(char *args) {
     if (args == NULL || *args == '\0') {
         printf("Usage: rm <directory>\n");
@@ -240,9 +343,6 @@ static const char *fr_text(FRESULT r)
     return (unsigned)r < sizeof(names) / sizeof(names[0]) ? names[r] : "error";
 }
 
-/* Builds the full new name for a move. If 'dst' is a folder the file keeps its
-   own name inside it (dst + "/" + name), because f_rename wants the complete new
-   path, not just the folder. Returns 1 on success, 0 if it doesn't fit. */
 static int build_move_target(const char *src, const char *dst, int dst_is_dir,
                              char *out, size_t out_size)
 {
@@ -466,7 +566,7 @@ static void start_program(uint32_t entry_address, char *args)
 
     entry(&api);
 }
-
+//
 //Run user program in USER folder
 static int try_user_program(const char *name, char *args)
 {
@@ -625,8 +725,8 @@ static void cmd_echo(char *args) {
     printf("%s\n", args ? args : "");
 }
 
-static const char *command_names[] = { "help", "about", "cd", "clear", "echo", "ls", "pwd", "cat", "write", "exec", "mkdir", "rm", "mv" };
-static void (*const command_funcs[])(char *) = { cmd_help, cmd_about, cmd_cd, cmd_clear, cmd_echo, cmd_ls, cmd_pwd, cmd_cat, cmd_write, cmd_exec, cmd_mkdir, cmd_rm, cmd_mv };
+static const char *command_names[] = { "help", "about", "cd", "clear", "echo", "ls", "pwd", "cat", "write", "edit", "exec", "mkdir", "rm", "mv" };
+static void (*const command_funcs[])(char *) = { cmd_help, cmd_about, cmd_cd, cmd_clear, cmd_echo, cmd_ls, cmd_pwd, cmd_cat, cmd_write, cmd_edit, cmd_exec, cmd_mkdir, cmd_rm, cmd_mv };
 #define NUM_COMMANDS (sizeof(command_names) / sizeof(command_names[0]))
 
 void shell_run(void) {
